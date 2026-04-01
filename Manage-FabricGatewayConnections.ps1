@@ -34,7 +34,7 @@ param(
     [string]$ClientId,            # App Registration (SPN) Application (client) ID
 
     [Parameter(Mandatory = $true)]
-    [string]$ClientSecret,        # Current SPN client secret (used to AUTHENTICATE to Fabric)
+    [string]$ClientSecret,        # Client secret used to AUTHENTICATE to Fabric
 
     # --- Connection target (the data-source SPN) ------------------------------
     [Parameter(Mandatory = $true)]
@@ -107,7 +107,7 @@ function Get-FabricHeaders {
 function Get-FabricConnections {
     param([string]$Token)
 
-    $uri = "https://api.fabric.microsoft.com/v1/connections"
+    $uri     = "https://api.fabric.microsoft.com/v1/connections"
     $headers = Get-FabricHeaders -Token $Token
 
     try {
@@ -125,7 +125,7 @@ function Get-FabricConnections {
 #
 #  For on-prem gateway connections, the Fabric API requires credentials to be
 #  RSA-OAEP encrypted using the gateway member's public key.
-#  This section uses .NET's RSACryptoServiceProvider directly.
+#  This section uses .NET's RSACryptoServiceProvider directly — no NuGet needed.
 # ============================================================================
 function Get-GatewayPublicKey {
     <#
@@ -138,7 +138,7 @@ function Get-GatewayPublicKey {
         [string]$GatewayId
     )
 
-    $uri = "https://api.powerbi.com/v1.0/myorg/gateways/$GatewayId"
+    $uri     = "https://api.powerbi.com/v1.0/myorg/gateways/$GatewayId"
     $headers = Get-FabricHeaders -Token $Token
 
     try {
@@ -165,9 +165,7 @@ function Get-EncryptedCredentials {
         [string]$SpnSecret
     )
 
-    # Build the credential JSON payload that the gateway expects.
-    # For ServicePrincipal type, the credentialData contains:
-    #   servicePrincipalClientId, servicePrincipalKey, servicePrincipalTenantId
+    # Build the credential JSON payload the gateway expects.
     $credentialData = @{
         credentialData = @(
             @{ name = "servicePrincipalClientId"; value = $SpnClientId }
@@ -176,19 +174,19 @@ function Get-EncryptedCredentials {
         )
     } | ConvertTo-Json -Depth 3 -Compress
 
-    # RSA-OAEP encryption using .NET
+    # FIX 1: RSAParameters is a .NET struct — use New-Object, not ::new()
     $exponentBytes = [Convert]::FromBase64String($GatewayPublicKey.exponent)
     $modulusBytes  = [Convert]::FromBase64String($GatewayPublicKey.modulus)
 
-    $rsaParams = New-Object System.Security.Cryptography.RSAParameters
+    $rsaParams          = New-Object System.Security.Cryptography.RSAParameters
     $rsaParams.Exponent = $exponentBytes
     $rsaParams.Modulus  = $modulusBytes
 
     $rsa = [System.Security.Cryptography.RSACryptoServiceProvider]::new(2048)
     $rsa.ImportParameters($rsaParams)
 
-    $plainBytes = [System.Text.Encoding]::UTF8.GetBytes($credentialData)
-    $encryptedBytes = $rsa.Encrypt($plainBytes, $true)  # $true = OAEP padding
+    $plainBytes     = [System.Text.Encoding]::UTF8.GetBytes($credentialData)
+    $encryptedBytes = $rsa.Encrypt($plainBytes, $true)   # $true = OAEP padding
 
     return [Convert]::ToBase64String($encryptedBytes)
 }
@@ -217,7 +215,7 @@ function New-OnPremGatewayConnection {
         -SpnSecret $SpnSecret
 
     # Step 3: call Create Connection
-    $uri = "https://api.fabric.microsoft.com/v1/connections"
+    $uri     = "https://api.fabric.microsoft.com/v1/connections"
     $headers = Get-FabricHeaders -Token $Token
 
     $body = @{
@@ -257,6 +255,7 @@ function New-OnPremGatewayConnection {
     }
     catch {
         Write-Error "Failed to create on-prem gateway connection: $_"
+        # FIX 2: Use ErrorDetails.Message — PS7 closes the response stream on error
         if ($_.ErrorDetails.Message) {
             Write-Error "API response: $($_.ErrorDetails.Message)"
         }
@@ -286,7 +285,7 @@ function Update-OnPremGatewayConnectionSpnSecret {
         -SpnSecret $SpnSecret
 
     # Step 3: call Update Connection (PATCH)
-    $uri = "https://api.fabric.microsoft.com/v1/connections/$ConnectionId"
+    $uri     = "https://api.fabric.microsoft.com/v1/connections/$ConnectionId"
     $headers = Get-FabricHeaders -Token $Token
 
     $body = @{
@@ -313,13 +312,13 @@ function Update-OnPremGatewayConnectionSpnSecret {
     }
     catch {
         Write-Error "Failed to update on-prem gateway connection: $_"
+        # FIX 2: Use ErrorDetails.Message — PS7 closes the response stream on error
         if ($_.ErrorDetails.Message) {
             Write-Error "API response: $($_.ErrorDetails.Message)"
         }
         throw
     }
 }
-
 
 # ============================================================================
 #  MAIN EXECUTION
@@ -335,7 +334,7 @@ Write-Host "[1/3] Authenticating as service principal ..."
 $accessToken = Get-FabricAccessToken -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret
 Write-Host "  -> Token acquired.`n"
 
-# Step 2: (Optional) List existing connections for reference
+# Step 2: List existing connections for reference
 Write-Host "[2/3] Listing existing connections ..."
 try {
     $connections = Get-FabricConnections -Token $accessToken
@@ -355,9 +354,10 @@ switch ($Action) {
 
     "CreateOnPremGateway" {
         if (-not $GatewayId) {
-            Write-Error "GatewayId is required for CreateOnPremGateway action."
+            Write-Error "GatewayId is required for CreateOnPremGateway."
             exit 1
         }
+        # FIX 3: Validate ServerName and DatabaseName before making the API call
         if (-not $ServerName -or -not $DatabaseName) {
             Write-Error "ServerName and DatabaseName are required for CreateOnPremGateway."
             exit 1
