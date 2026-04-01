@@ -1,15 +1,15 @@
 <#
 .SYNOPSIS
-    Manage Fabric API on-premises gateway connections with Service Principal credentials
-    using Azure Key Vault secret references.
+    Manage Fabric API on-premises gateway connections with Service Principal credentials.
 
 .DESCRIPTION
     This script is designed to run in Azure DevOps Pipelines (or any CI/CD system).
     It supports OnPremisesGateway connections only, where credentials are:
-      1. RSA-OAEP encrypted using the gateway's public key
-      2. Referenced via Azure Key Vault (servicePrincipalSecretReference)
+      1. Fetched from Azure Key Vault via the ADO variable group at runtime
+      2. RSA-OAEP encrypted using the gateway's public key (fetched from Power BI API)
+      3. Sent as an encrypted blob to the Fabric API
 
-    No plaintext secrets are passed in the request body.
+    The actual secret value is never logged — it is encrypted before being sent.
 
 .NOTES
     Prerequisites:
@@ -17,9 +17,8 @@
       2. Fabric tenant setting "Service principals can use Fabric APIs" enabled
          for a security group that contains your SPN.
       3. The SPN must have permissions on the gateway.
-      4. A Key Vault connection in Fabric with access to the secret.
-      5. For Azure DevOps: store TenantId, ClientId, ClientSecret as secret
-         pipeline variables or pull them from Azure Key Vault.
+      4. For Azure DevOps: store TenantId, ClientId, ClientSecret, and
+         DataSourceSpnSecret as secret pipeline variables (linked to Key Vault).
 
     Author : Example — adapt to your environment
     Date   : 2026-04-01
@@ -37,32 +36,26 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$ClientSecret,        # Current SPN client secret (used to AUTHENTICATE to Fabric)
 
-    # --- Connection target (the data-source SPN whose secret is in Key Vault) -
+    # --- Connection target (the data-source SPN) ------------------------------
     [Parameter(Mandatory = $true)]
     [string]$DataSourceSpnClientId,   # Client ID of the SPN used BY the connection
 
     [Parameter(Mandatory = $true)]
     [string]$DataSourceSpnTenantId,   # Tenant ID of the SPN used BY the connection
 
-    # --- Key Vault secret reference -------------------------------------------
     [Parameter(Mandatory = $true)]
-    [string]$KeyVaultConnectionId,    # The Fabric connection ID of your Key Vault connection
-
-    [Parameter(Mandatory = $true)]
-    [string]$KeyVaultSecretName,      # Name of the secret in Key Vault
-
-    [string]$KeyVaultSecretVersion,   # Version (optional, omit or "" for latest)
+    [string]$DataSourceSpnSecret,     # Secret for the data-source SPN (fetched from Key Vault, encrypted before use)
 
     # --- Connection details ---------------------------------------------------
     [string]$ConnectionId,            # Existing connection ID (for UPDATE scenario)
     [string]$GatewayId,               # Gateway ID (required for on-prem scenarios)
     [string]$DisplayName = "Automated-SPN-Connection",
-    [string]$ServerName = "myserver.database.windows.net",
-    [string]$DatabaseName = "mydatabase",
+    [string]$ServerName,
+    [string]$DatabaseName,
 
     # --- Behaviour flags ------------------------------------------------------
     [ValidateSet("CreateOnPremGateway", "UpdateOnPremGateway")]
-    [string]$Action = "CreateOnPremGateway",
+    [string]$Action = "UpdateOnPremGateway",
 
     [bool]$SkipTestConnection = $false
 )
@@ -162,36 +155,26 @@ function Get-GatewayPublicKey {
 function Get-EncryptedCredentials {
     <#
     .SYNOPSIS
-        Encrypts service principal credentials (with Key Vault secret reference)
-        using the gateway's RSA public key via .NET RSACryptoServiceProvider.
+        Encrypts service principal credentials using the gateway's RSA public key
+        via .NET RSACryptoServiceProvider (RSA-OAEP padding).
     #>
     param(
         [object]$GatewayPublicKey,
         [string]$SpnClientId,
         [string]$SpnTenantId,
-        [string]$KeyVaultConnectionId,
-        [string]$KeyVaultSecretName,
-        [string]$KeyVaultSecretVersion
+        [string]$SpnSecret
     )
 
     # Build the credential JSON payload that the gateway expects.
-    # Uses servicePrincipalSecretReference to point to Key Vault instead of
-    # passing the secret value directly.
-    $secretRef = @{
-        connectionId = $KeyVaultConnectionId
-        secretName   = $KeyVaultSecretName
-    }
-    if ($KeyVaultSecretVersion) {
-        $secretRef.version = $KeyVaultSecretVersion
-    }
-
+    # For ServicePrincipal type, the credentialData contains:
+    #   servicePrincipalClientId, servicePrincipalKey, servicePrincipalTenantId
     $credentialData = @{
         credentialData = @(
             @{ name = "servicePrincipalClientId"; value = $SpnClientId }
+            @{ name = "servicePrincipalKey";      value = $SpnSecret   }
             @{ name = "servicePrincipalTenantId"; value = $SpnTenantId }
         )
-        servicePrincipalSecretReference = $secretRef
-    } | ConvertTo-Json -Depth 4 -Compress
+    } | ConvertTo-Json -Depth 3 -Compress
 
     # RSA-OAEP encryption using .NET
     $exponentBytes = [Convert]::FromBase64String($GatewayPublicKey.exponent)
@@ -219,34 +202,21 @@ function New-OnPremGatewayConnection {
         [string]$DatabaseName,
         [string]$SpnClientId,
         [string]$SpnTenantId,
-        [string]$KeyVaultConnectionId,
-        [string]$KeyVaultSecretName,
-        [string]$KeyVaultSecretVersion,
+        [string]$SpnSecret,
         [bool]  $SkipTestConnection = $false
     )
 
     # Step 1: get gateway public key
     $publicKey = Get-GatewayPublicKey -Token $Token -GatewayId $GatewayId
 
-    # Step 2: encrypt credentials (with Key Vault reference)
+    # Step 2: encrypt credentials
     $encryptedCreds = Get-EncryptedCredentials `
         -GatewayPublicKey $publicKey `
         -SpnClientId $SpnClientId `
         -SpnTenantId $SpnTenantId `
-        -KeyVaultConnectionId $KeyVaultConnectionId `
-        -KeyVaultSecretName $KeyVaultSecretName `
-        -KeyVaultSecretVersion $KeyVaultSecretVersion
+        -SpnSecret $SpnSecret
 
-    # Step 3: build Key Vault secret reference for the API request
-    $secretRef = @{
-        connectionId = $KeyVaultConnectionId
-        secretName   = $KeyVaultSecretName
-    }
-    if ($KeyVaultSecretVersion) {
-        $secretRef.version = $KeyVaultSecretVersion
-    }
-
-    # Step 4: call Create Connection
+    # Step 3: call Create Connection
     $uri = "https://api.fabric.microsoft.com/v1/connections"
     $headers = Get-FabricHeaders -Token $Token
 
@@ -268,11 +238,8 @@ function New-OnPremGatewayConnection {
             connectionEncryption = "Encrypted"
             skipTestConnection   = $SkipTestConnection
             credentials          = @{
-                credentialType                  = "ServicePrincipal"
-                servicePrincipalClientId        = $SpnClientId
-                tenantId                        = $SpnTenantId
-                servicePrincipalSecretReference = $secretRef
-                values                          = @(
+                credentialType = "ServicePrincipal"
+                values         = @(
                     @{
                         gatewayId            = $GatewayId
                         encryptedCredentials = $encryptedCreds
@@ -280,7 +247,7 @@ function New-OnPremGatewayConnection {
                 )
             }
         }
-    } | ConvertTo-Json -Depth 7
+    } | ConvertTo-Json -Depth 6
 
     Write-Host "Creating OnPremisesGateway connection '$DisplayName' ..."
     try {
@@ -305,34 +272,21 @@ function Update-OnPremGatewayConnectionSpnSecret {
         [string]$GatewayId,
         [string]$SpnClientId,
         [string]$SpnTenantId,
-        [string]$KeyVaultConnectionId,
-        [string]$KeyVaultSecretName,
-        [string]$KeyVaultSecretVersion,
+        [string]$SpnSecret,
         [bool]  $SkipTestConnection = $false
     )
 
     # Step 1: get gateway public key
     $publicKey = Get-GatewayPublicKey -Token $Token -GatewayId $GatewayId
 
-    # Step 2: encrypt credentials (with Key Vault reference)
+    # Step 2: encrypt new credentials
     $encryptedCreds = Get-EncryptedCredentials `
         -GatewayPublicKey $publicKey `
         -SpnClientId $SpnClientId `
         -SpnTenantId $SpnTenantId `
-        -KeyVaultConnectionId $KeyVaultConnectionId `
-        -KeyVaultSecretName $KeyVaultSecretName `
-        -KeyVaultSecretVersion $KeyVaultSecretVersion
+        -SpnSecret $SpnSecret
 
-    # Step 3: build Key Vault secret reference for the API request
-    $secretRef = @{
-        connectionId = $KeyVaultConnectionId
-        secretName   = $KeyVaultSecretName
-    }
-    if ($KeyVaultSecretVersion) {
-        $secretRef.version = $KeyVaultSecretVersion
-    }
-
-    # Step 4: call Update Connection (PATCH)
+    # Step 3: call Update Connection (PATCH)
     $uri = "https://api.fabric.microsoft.com/v1/connections/$ConnectionId"
     $headers = Get-FabricHeaders -Token $Token
 
@@ -341,11 +295,8 @@ function Update-OnPremGatewayConnectionSpnSecret {
         credentialDetails = @{
             skipTestConnection = $SkipTestConnection
             credentials        = @{
-                credentialType                  = "ServicePrincipal"
-                servicePrincipalClientId        = $SpnClientId
-                tenantId                        = $SpnTenantId
-                servicePrincipalSecretReference = $secretRef
-                values                          = @(
+                credentialType = "ServicePrincipal"
+                values         = @(
                     @{
                         gatewayId            = $GatewayId
                         encryptedCredentials = $encryptedCreds
@@ -353,9 +304,9 @@ function Update-OnPremGatewayConnectionSpnSecret {
                 )
             }
         }
-    } | ConvertTo-Json -Depth 6
+    } | ConvertTo-Json -Depth 5
 
-    Write-Host "Updating on-prem gateway connection '$ConnectionId' with Key Vault secret reference ..."
+    Write-Host "Updating on-prem gateway connection '$ConnectionId' with new SPN secret ..."
     try {
         $result = Invoke-RestMethod -Uri $uri -Headers $headers -Method PATCH -Body $body
         Write-Host "  -> Updated successfully."
@@ -417,9 +368,7 @@ switch ($Action) {
             -DatabaseName $DatabaseName `
             -SpnClientId $DataSourceSpnClientId `
             -SpnTenantId $DataSourceSpnTenantId `
-            -KeyVaultConnectionId $KeyVaultConnectionId `
-            -KeyVaultSecretName $KeyVaultSecretName `
-            -KeyVaultSecretVersion $KeyVaultSecretVersion `
+            -SpnSecret $DataSourceSpnSecret `
             -SkipTestConnection $SkipTestConnection
     }
 
@@ -434,9 +383,7 @@ switch ($Action) {
             -GatewayId $GatewayId `
             -SpnClientId $DataSourceSpnClientId `
             -SpnTenantId $DataSourceSpnTenantId `
-            -KeyVaultConnectionId $KeyVaultConnectionId `
-            -KeyVaultSecretName $KeyVaultSecretName `
-            -KeyVaultSecretVersion $KeyVaultSecretVersion `
+            -SpnSecret $DataSourceSpnSecret `
             -SkipTestConnection $SkipTestConnection
     }
 }
