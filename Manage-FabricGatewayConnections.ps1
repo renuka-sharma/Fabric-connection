@@ -180,7 +180,7 @@ function Get-EncryptedCredentials {
     $exponentBytes = [Convert]::FromBase64String($GatewayPublicKey.exponent)
     $modulusBytes  = [Convert]::FromBase64String($GatewayPublicKey.modulus)
 
-    $rsaParams = [System.Security.Cryptography.RSAParameters]::new()
+    $rsaParams = New-Object System.Security.Cryptography.RSAParameters
     $rsaParams.Exponent = $exponentBytes
     $rsaParams.Modulus  = $modulusBytes
 
@@ -257,9 +257,8 @@ function New-OnPremGatewayConnection {
     }
     catch {
         Write-Error "Failed to create on-prem gateway connection: $_"
-        if ($_.Exception.Response) {
-            $reader = [System.IO.StreamReader]::new($_.Exception.Response.GetResponseStream())
-            Write-Error $reader.ReadToEnd()
+        if ($_.ErrorDetails.Message) {
+            Write-Error "API response: $($_.ErrorDetails.Message)"
         }
         throw
     }
@@ -314,9 +313,8 @@ function Update-OnPremGatewayConnectionSpnSecret {
     }
     catch {
         Write-Error "Failed to update on-prem gateway connection: $_"
-        if ($_.Exception.Response) {
-            $reader = [System.IO.StreamReader]::new($_.Exception.Response.GetResponseStream())
-            Write-Error $reader.ReadToEnd()
+        if ($_.ErrorDetails.Message) {
+            Write-Error "API response: $($_.ErrorDetails.Message)"
         }
         throw
     }
@@ -358,6 +356,10 @@ switch ($Action) {
     "CreateOnPremGateway" {
         if (-not $GatewayId) {
             Write-Error "GatewayId is required for CreateOnPremGateway action."
+            exit 1
+        }
+        if (-not $ServerName -or -not $DatabaseName) {
+            Write-Error "ServerName and DatabaseName are required for CreateOnPremGateway."
             exit 1
         }
         New-OnPremGatewayConnection `
