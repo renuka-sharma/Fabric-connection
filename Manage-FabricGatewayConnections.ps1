@@ -182,11 +182,19 @@ function Get-EncryptedCredentials {
     $rsaParams.Exponent = $exponentBytes
     $rsaParams.Modulus  = $modulusBytes
 
-    $rsa = [System.Security.Cryptography.RSACryptoServiceProvider]::new(2048)
+    # RSA.Create() (CNG-backed on Windows, OpenSSL-backed on Linux/macOS) derives
+    # its effective key size from ImportParameters, so it correctly uses the full
+    # modulus length (Power BI gateways publish 4096-bit keys → 470-byte OAEP limit).
+    # RSACryptoServiceProvider with a hardcoded or default 2048-bit constructor arg
+    # reports KeySize=2048 after ImportParameters on some runtimes, capping the limit
+    # at 214 bytes — too small for the credential JSON (~260-300 bytes).
+    # NOTE: RSA cannot encrypt chunks and concatenate ciphertext; that produces an
+    # undecryptable blob. A single Encrypt() call is the only correct approach.
+    $rsa = [System.Security.Cryptography.RSA]::Create()
     $rsa.ImportParameters($rsaParams)
 
     $plainBytes     = [System.Text.Encoding]::UTF8.GetBytes($credentialData)
-    $encryptedBytes = $rsa.Encrypt($plainBytes, $true)   # $true = OAEP padding
+    $encryptedBytes = $rsa.Encrypt($plainBytes, [System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA1)
 
     return [Convert]::ToBase64String($encryptedBytes)
 }

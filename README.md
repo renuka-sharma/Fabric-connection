@@ -49,7 +49,7 @@ ADO schedule / manual trigger
         ▼
 3. Build credential JSON payload:
    { servicePrincipalClientId, servicePrincipalKey, servicePrincipalTenantId }
-   Encrypt with gateway public key using RSA-OAEP (.NET RSACryptoServiceProvider)
+   Encrypt with gateway public key using RSA-OAEP (.NET RSA.Create())
         │
         ▼
 4a. CREATE  →  POST  /v1/connections          (new connection)
@@ -153,7 +153,7 @@ Run the pipeline once per connection, passing a different `connectionId` each ti
 ## Security notes
 
 - **No plaintext secrets in pipeline logs.** All secrets are injected as masked variables from the Key Vault-linked variable group.
-- **No NuGet dependencies.** Encryption uses `System.Security.Cryptography.RSACryptoServiceProvider` from the .NET runtime — always available on `windows-latest` ADO agents, no install step required.
+- **No NuGet dependencies.** Encryption uses `System.Security.Cryptography.RSA` from the .NET runtime — always available on `windows-latest` ADO agents, no install step required.
 - **The automation SPN should have minimum permissions.** It needs gateway admin rights and the Fabric API SPN setting enabled — nothing broader.
 - **The data-source SPN secret is encrypted before it leaves the pipeline.** The Fabric API never receives the plaintext value — only the RSA-OAEP encrypted blob, which only the gateway can decrypt.
 
@@ -168,7 +168,22 @@ Run the pipeline once per connection, passing a different `connectionId` each ti
 | `IncorrectCredentials` from Fabric API | Wrong secret value in Key Vault | Verify `DataSourceSpnNewSecret` in Key Vault matches the current active secret in Entra ID |
 | `Parameter cannot be found` on pipeline start | Script and pipeline parameter mismatch | Ensure `ScriptArguments` in the YAML matches the `param()` block in the script exactly |
 | `Constructor not found` on RSAParameters | Old version of the script using `::new()` | Ensure you are using the fixed script with `New-Object System.Security.Cryptography.RSAParameters` |
+| `Bad Length` / `wrong input size` on Encrypt | Credential payload exceeds RSA key limit | Verify the gateway uses a 4096-bit key; a 2048-bit key allows only 214 bytes, the credential JSON is ~275 bytes |
 | Pipeline passes but connection still fails at refresh | `skipTestConnection` was `true` and secret is wrong | Run with `skipTestConnection = false` to surface the real error |
+
+---
+
+## Encryption fix — RSACryptoServiceProvider → RSA.Create()
+
+The credential encryption was updated from the legacy `RSACryptoServiceProvider` to `RSA.Create()`.
+
+**Why it broke:** `RSACryptoServiceProvider::new(2048)` locks its internal context at 2048 bits. Even after calling `ImportParameters` with the gateway's actual 4096-bit public key, the provider still enforced the 2048-bit OAEP limit of **214 bytes**. The credential JSON (two GUIDs + the SPN secret) is ~275 bytes — over that limit — which caused the `"Bad Length."` error.
+
+**What was changed:** Replaced `RSACryptoServiceProvider` with `RSA.Create()`, the modern .NET factory. It derives the effective key size from the imported modulus, correctly applying the 4096-bit limit of **470 bytes**, which fits the credential payload.
+
+**When it can happen again:**
+- If the credential payload grows beyond 470 bytes (e.g. new fields added, very long secret).
+- If a gateway is registered with a 2048-bit key — the code fix alone cannot resolve that; the gateway key would need to be regenerated at 4096 bits.
 
 ---
 
