@@ -63,11 +63,12 @@ param(
 # ============================================================================
 #  SECTION 1 — Obtain a Bearer Token (client_credentials flow)
 # ============================================================================
-function Get-FabricAccessToken {
+function Get-AccessToken {
     param(
         [string]$TenantId,
         [string]$ClientId,
-        [string]$ClientSecret
+        [string]$ClientSecret,
+        [string]$Scope
     )
 
     $tokenUrl = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
@@ -75,17 +76,17 @@ function Get-FabricAccessToken {
     $body = @{
         client_id     = $ClientId
         client_secret = $ClientSecret
-        scope         = "https://api.fabric.microsoft.com/.default"
+        scope         = $Scope
         grant_type    = "client_credentials"
     }
 
     try {
-        $response = Invoke-RestMethod -Uri $tokenUrl -Method POST -Body $body `
+        $response = Invoke-FabricRestMethod -Uri $tokenUrl -Method POST -Body $body `
                         -ContentType "application/x-www-form-urlencoded"
         return $response.access_token
     }
     catch {
-        Write-Error "Failed to obtain access token: $_"
+        Write-Error "Failed to obtain access token for scope '$Scope': $_"
         throw
     }
 }
@@ -102,7 +103,58 @@ function Get-FabricHeaders {
 }
 
 # ============================================================================
-#  SECTION 3 — List existing connections (useful for discovery)
+#  SECTION 3 — HTTP wrapper: retries on HTTP 429 with Retry-After back-off
+# ============================================================================
+function Invoke-FabricRestMethod {
+    <#
+    .SYNOPSIS
+        Thin wrapper around Invoke-RestMethod that retries up to MaxRetries times
+        when the server responds with HTTP 429, honouring the Retry-After header.
+    #>
+    param(
+        [string]   $Uri,
+        [string]   $Method,
+        [hashtable]$Headers,
+        [object]   $Body,
+        [string]   $ContentType,
+        [int]      $MaxRetries = 3
+    )
+
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try {
+            $params = @{ Uri = $Uri; Method = $Method }
+            if ($Headers)     { $params['Headers']     = $Headers     }
+            if ($Body)        { $params['Body']        = $Body        }
+            if ($ContentType) { $params['ContentType'] = $ContentType }
+
+            return Invoke-RestMethod @params
+        }
+        catch {
+            $statusCode = $_.Exception.Response.StatusCode.value__
+            if ($statusCode -eq 429 -and $attempt -le $MaxRetries) {
+                $retryAfter = 5   # fallback wait in seconds
+                $responseHeaders = $_.Exception.Response.Headers
+                if ($responseHeaders -and $responseHeaders.Contains('Retry-After')) {
+                    $headerValue = $responseHeaders.GetValues('Retry-After') | Select-Object -First 1
+                    $parsed = 0
+                    if ([int]::TryParse($headerValue, [ref]$parsed) -and $parsed -gt 0) {
+                        $retryAfter = $parsed
+                    }
+                }
+                Write-Warning "HTTP 429 — rate limited. Retrying in $retryAfter second(s) (attempt $attempt of $MaxRetries) ..."
+                Start-Sleep -Seconds $retryAfter
+            }
+            else {
+                throw
+            }
+        }
+    }
+}
+
+# ============================================================================
+#  SECTION 4 — List existing connections (useful for discovery)
 # ============================================================================
 function Get-FabricConnections {
     param([string]$Token)
@@ -111,7 +163,7 @@ function Get-FabricConnections {
     $headers = Get-FabricHeaders -Token $Token
 
     try {
-        $result = Invoke-RestMethod -Uri $uri -Headers $headers -Method GET
+        $result = Invoke-FabricRestMethod -Uri $uri -Headers $headers -Method GET
         return $result.value
     }
     catch {
@@ -121,7 +173,7 @@ function Get-FabricConnections {
 }
 
 # ============================================================================
-#  SECTION 4 — ON-PREMISES GATEWAY: encrypt credentials with gateway public key
+#  SECTION 5 — ON-PREMISES GATEWAY: encrypt credentials with gateway public key
 #
 #  For on-prem gateway connections, the Fabric API requires credentials to be
 #  RSA-OAEP encrypted using the gateway member's public key.
@@ -131,18 +183,19 @@ function Get-GatewayPublicKey {
     <#
     .SYNOPSIS
         Retrieves the public key of a gateway, needed to encrypt credentials.
-        Uses the Power BI REST API (the Fabric API delegates to the same backend).
+        Uses the Power BI REST API, which requires a Power BI-scoped token
+        (https://analysis.windows.net/powerbi/api/.default).
     #>
     param(
-        [string]$Token,
+        [string]$PowerBiToken,
         [string]$GatewayId
     )
 
     $uri     = "https://api.powerbi.com/v1.0/myorg/gateways/$GatewayId"
-    $headers = Get-FabricHeaders -Token $Token
+    $headers = Get-FabricHeaders -Token $PowerBiToken
 
     try {
-        $gateway = Invoke-RestMethod -Uri $uri -Headers $headers -Method GET
+        $gateway = Invoke-FabricRestMethod -Uri $uri -Headers $headers -Method GET
         Write-Host "  Gateway '$($gateway.name)' public key retrieved."
         return $gateway.publicKey
     }
@@ -155,8 +208,20 @@ function Get-GatewayPublicKey {
 function Get-EncryptedCredentials {
     <#
     .SYNOPSIS
-        Encrypts service principal credentials using the gateway's RSA public key
-        via .NET RSACryptoServiceProvider (RSA-OAEP padding).
+        Encrypts service principal credentials using hybrid encryption matching the
+        Microsoft Power BI SDK (AsymmetricHigherKeyEncryptionHelper).
+
+    .DESCRIPTION
+        Direct RSA encryption of the credential JSON fails because the payload
+        (~275 bytes) exceeds the RSA-OAEP limit of a 2048-bit gateway key (190 bytes
+        with SHA-256, 214 bytes with SHA-1).  The gateway expects hybrid encryption:
+
+          1. Generate ephemeral AES-256 key (32 bytes) + HMAC-SHA256 key (64 bytes)
+          2. Encrypt the credential JSON with AES-256-CBC + HMAC-SHA256 (encrypt-then-MAC)
+          3. RSA-OAEP-SHA1 encrypt only the 98-byte key bundle — well within the limit
+          4. Return base64(RSA-encrypted keys) + base64(AES ciphertext blob)
+
+        Output format mirrors AsymmetricHigherKeyEncryptionHelper.cs in PowerBI-CSharp.
     #>
     param(
         [object]$GatewayPublicKey,
@@ -174,26 +239,65 @@ function Get-EncryptedCredentials {
         )
     } | ConvertTo-Json -Depth 3 -Compress
 
-    # FIX 1: RSAParameters is a .NET struct — use New-Object, not ::new()
-    $exponentBytes = [Convert]::FromBase64String($GatewayPublicKey.exponent)
-    $modulusBytes  = [Convert]::FromBase64String($GatewayPublicKey.modulus)
+    $plainBytes = [System.Text.Encoding]::UTF8.GetBytes($credentialData)
 
+    # --- Step 1: Generate ephemeral keys ---
+    $rng    = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $keyEnc = New-Object byte[] 32   # AES-256 key
+    $keyMac = New-Object byte[] 64   # HMAC-SHA256 key
+    $rng.GetBytes($keyEnc)
+    $rng.GetBytes($keyMac)
+
+    # --- Step 2: AES-256-CBC encrypt, then HMAC-SHA256 authenticate ---
+    $aes         = [System.Security.Cryptography.Aes]::Create()
+    $aes.KeySize = 256
+    $aes.Mode    = [System.Security.Cryptography.CipherMode]::CBC
+    $aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+    $aes.Key     = $keyEnc
+    $aes.GenerateIV()
+    $iv         = $aes.IV
+    $encryptor  = $aes.CreateEncryptor()
+    $ciphertext = $encryptor.TransformFinalBlock($plainBytes, 0, $plainBytes.Length)
+
+    # Algorithm identifier bytes: AES256CbcPkcs7=0, HMACSHA256=0  (matches SDK enums)
+    $algoBytes  = [byte[]](0, 0)
+    $hmac       = New-Object System.Security.Cryptography.HMACSHA256 @(,$keyMac)
+    $tag        = $hmac.ComputeHash($algoBytes + $iv + $ciphertext)
+
+    # Ciphertext blob: algoBytes(2) + tag(32) + IV(16) + ciphertext(N)
+    $ciphertextBlob = $algoBytes + $tag + $iv + $ciphertext
+
+    # --- Step 3: Package ephemeral keys ---
+    # keys[0] = KeyLengths.KeyLength32 (enum value 0)
+    # keys[1] = KeyLengths.KeyLength64 (enum value 1)
+    # keys[2..33]  = AES key  (32 bytes)
+    # keys[34..97] = HMAC key (64 bytes)
+    $keys    = New-Object byte[] 98
+    $keys[0] = 0
+    $keys[1] = 1
+    [Array]::Copy($keyEnc, 0, $keys, 2,  32)
+    [Array]::Copy($keyMac, 0, $keys, 34, 64)
+
+    # --- Step 4: RSA-OAEP-SHA1 encrypt the 98-byte key bundle ---
+    # OaepSHA1 allows up to 214 bytes with a 2048-bit key (vs 190 for OaepSHA256)
+    # and matches the padding the gateway backend expects.
+    $exponentBytes      = [Convert]::FromBase64String($GatewayPublicKey.exponent)
+    $modulusBytes       = [Convert]::FromBase64String($GatewayPublicKey.modulus)
     $rsaParams          = New-Object System.Security.Cryptography.RSAParameters
     $rsaParams.Exponent = $exponentBytes
     $rsaParams.Modulus  = $modulusBytes
-
-    $rsa = [System.Security.Cryptography.RSA]::Create()
+    $rsa                = [System.Security.Cryptography.RSA]::Create()
     $rsa.ImportParameters($rsaParams)
+    $encryptedKeys      = $rsa.Encrypt($keys, [System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA1)
 
-    $plainBytes     = [System.Text.Encoding]::UTF8.GetBytes($credentialData)
-    $encryptedBytes = $rsa.Encrypt($plainBytes, [System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA1)
-
-    return [Convert]::ToBase64String($encryptedBytes)
+    # --- Step 5: Concatenate both base64 blobs (matches SDK output format) ---
+    return [Convert]::ToBase64String($encryptedKeys) + [Convert]::ToBase64String($ciphertextBlob)
 }
 
 function New-OnPremGatewayConnection {
     param(
-        [string]$Token,
+        [string]$FabricToken,
+        [string]$PowerBiToken,
         [string]$GatewayId,
         [string]$DisplayName,
         [string]$ServerName,
@@ -204,8 +308,8 @@ function New-OnPremGatewayConnection {
         [bool]  $SkipTestConnection = $false
     )
 
-    # Step 1: get gateway public key
-    $publicKey = Get-GatewayPublicKey -Token $Token -GatewayId $GatewayId
+    # Step 1: get gateway public key (Power BI API — needs Power BI-scoped token)
+    $publicKey = Get-GatewayPublicKey -PowerBiToken $PowerBiToken -GatewayId $GatewayId
 
     # Step 2: encrypt credentials
     $encryptedCreds = Get-EncryptedCredentials `
@@ -214,9 +318,9 @@ function New-OnPremGatewayConnection {
         -SpnTenantId $SpnTenantId `
         -SpnSecret $SpnSecret
 
-    # Step 3: call Create Connection
+    # Step 3: call Create Connection (Fabric API — needs Fabric-scoped token)
     $uri     = "https://api.fabric.microsoft.com/v1/connections"
-    $headers = Get-FabricHeaders -Token $Token
+    $headers = Get-FabricHeaders -Token $FabricToken
 
     $body = @{
         connectivityType  = "OnPremisesGateway"
@@ -249,7 +353,7 @@ function New-OnPremGatewayConnection {
 
     Write-Host "Creating OnPremisesGateway connection '$DisplayName' ..."
     try {
-        $result = Invoke-RestMethod -Uri $uri -Headers $headers -Method POST -Body $body
+        $result = Invoke-FabricRestMethod -Uri $uri -Headers $headers -Method POST -Body $body -ContentType "application/json"
         Write-Host "  -> Created successfully. Connection ID: $($result.id)"
         return $result
     }
@@ -265,7 +369,8 @@ function New-OnPremGatewayConnection {
 
 function Update-OnPremGatewayConnectionSpnSecret {
     param(
-        [string]$Token,
+        [string]$FabricToken,
+        [string]$PowerBiToken,
         [string]$ConnectionId,
         [string]$GatewayId,
         [string]$SpnClientId,
@@ -274,8 +379,8 @@ function Update-OnPremGatewayConnectionSpnSecret {
         [bool]  $SkipTestConnection = $false
     )
 
-    # Step 1: get gateway public key
-    $publicKey = Get-GatewayPublicKey -Token $Token -GatewayId $GatewayId
+    # Step 1: get gateway public key (Power BI API — needs Power BI-scoped token)
+    $publicKey = Get-GatewayPublicKey -PowerBiToken $PowerBiToken -GatewayId $GatewayId
 
     # Step 2: encrypt new credentials
     $encryptedCreds = Get-EncryptedCredentials `
@@ -284,9 +389,9 @@ function Update-OnPremGatewayConnectionSpnSecret {
         -SpnTenantId $SpnTenantId `
         -SpnSecret $SpnSecret
 
-    # Step 3: call Update Connection (PATCH)
+    # Step 3: call Update Connection (PATCH — Fabric API — needs Fabric-scoped token)
     $uri     = "https://api.fabric.microsoft.com/v1/connections/$ConnectionId"
-    $headers = Get-FabricHeaders -Token $Token
+    $headers = Get-FabricHeaders -Token $FabricToken
 
     $body = @{
         connectivityType  = "OnPremisesGateway"
@@ -306,7 +411,7 @@ function Update-OnPremGatewayConnectionSpnSecret {
 
     Write-Host "Updating on-prem gateway connection '$ConnectionId' with new SPN secret ..."
     try {
-        $result = Invoke-RestMethod -Uri $uri -Headers $headers -Method PATCH -Body $body
+        $result = Invoke-FabricRestMethod -Uri $uri -Headers $headers -Method PATCH -Body $body
         Write-Host "  -> Updated successfully."
         return $result
     }
@@ -329,15 +434,18 @@ Write-Host " Fabric Connection Manager — Action: $Action"
 Write-Host "============================================="
 Write-Host ""
 
-# Step 1: Authenticate
+# Step 1: Authenticate — acquire one token per API surface
 Write-Host "[1/3] Authenticating as service principal ..."
-$accessToken = Get-FabricAccessToken -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret
-Write-Host "  -> Token acquired.`n"
+$fabricToken = Get-AccessToken -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret `
+                   -Scope "https://api.fabric.microsoft.com/.default"
+$powerBiToken = Get-AccessToken -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret `
+                   -Scope "https://analysis.windows.net/powerbi/api/.default"
+Write-Host "  -> Tokens acquired (Fabric + Power BI).`n"
 
 # Step 2: List existing connections for reference
 Write-Host "[2/3] Listing existing connections ..."
 try {
-    $connections = Get-FabricConnections -Token $accessToken
+    $connections = Get-FabricConnections -Token $fabricToken
     Write-Host "  -> Found $($connections.Count) connection(s)."
     foreach ($conn in $connections) {
         Write-Host "     - [$($conn.connectivityType)] $($conn.displayName) (ID: $($conn.id))"
@@ -357,13 +465,13 @@ switch ($Action) {
             Write-Error "GatewayId is required for CreateOnPremGateway."
             exit 1
         }
-        # FIX 3: Validate ServerName and DatabaseName before making the API call
         if (-not $ServerName -or -not $DatabaseName) {
             Write-Error "ServerName and DatabaseName are required for CreateOnPremGateway."
             exit 1
         }
         New-OnPremGatewayConnection `
-            -Token $accessToken `
+            -FabricToken $fabricToken `
+            -PowerBiToken $powerBiToken `
             -GatewayId $GatewayId `
             -DisplayName $DisplayName `
             -ServerName $ServerName `
@@ -380,7 +488,8 @@ switch ($Action) {
             exit 1
         }
         Update-OnPremGatewayConnectionSpnSecret `
-            -Token $accessToken `
+            -FabricToken $fabricToken `
+            -PowerBiToken $powerBiToken `
             -ConnectionId $ConnectionId `
             -GatewayId $GatewayId `
             -SpnClientId $DataSourceSpnClientId `
