@@ -59,7 +59,7 @@ param(
     [ValidateSet("CreateOnPremGateway", "UpdateOnPremGateway")]
     [string]$Action = "UpdateOnPremGateway",
 
-    [bool]$SkipTestConnection = $false
+    [bool]$SkipTestConnection = $true
 )
 
 # ============================================================================
@@ -293,6 +293,12 @@ function Get-EncryptedCredentials {
     $encryptedKeys      = $rsa.Encrypt($keys, [System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA1)
 
     # --- Step 5: Concatenate both base64 blobs (matches SDK output format) ---
+    # The gateway splits this string by position, not by a delimiter.
+    # A 2048-bit RSA key always produces exactly 256 bytes of ciphertext, which
+    # base64-encodes to exactly 344 characters. The gateway reads the first 344
+    # characters as the RSA-encrypted key bundle and treats everything after that
+    # as the AES ciphertext blob. No separator is needed because the RSA output
+    # length is fixed for a given key size.
     return [Convert]::ToBase64String($encryptedKeys) + [Convert]::ToBase64String($ciphertextBlob)
 }
 
