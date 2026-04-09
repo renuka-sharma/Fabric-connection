@@ -1,3 +1,5 @@
+#Requires -Version 7
+
 <#
 .SYNOPSIS
     Manage Fabric API on-premises gateway connections with Service Principal credentials.
