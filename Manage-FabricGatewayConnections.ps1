@@ -283,14 +283,15 @@ function Get-EncryptedCredentials {
     # --- Step 4: RSA-OAEP-SHA1 encrypt the 98-byte key bundle ---
     # OaepSHA1 allows up to 214 bytes with a 2048-bit key (vs 190 for OaepSHA256)
     # and matches the padding the gateway backend expects.
+
     $exponentBytes      = [Convert]::FromBase64String($GatewayPublicKey.exponent)
     $modulusBytes       = [Convert]::FromBase64String($GatewayPublicKey.modulus)
     $rsaParams          = New-Object System.Security.Cryptography.RSAParameters
     $rsaParams.Exponent = $exponentBytes
     $rsaParams.Modulus  = $modulusBytes
-    $rsa                = [System.Security.Cryptography.RSA]::Create()
+    $rsa                = New-Object System.Security.Cryptography.RSACryptoServiceProvider
     $rsa.ImportParameters($rsaParams)
-    $encryptedKeys      = $rsa.Encrypt($keys, [System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA1)
+    $encryptedKeys      = $rsa.Encrypt($keys, $true)   # $true = OAEP (SHA-1), matching CAPI gateway
 
     # --- Step 5: Concatenate both base64 blobs (matches SDK output format) ---
     # The gateway splits this string by position, not by a delimiter.
