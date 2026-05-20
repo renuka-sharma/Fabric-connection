@@ -88,7 +88,7 @@ function Get-AccessToken {
         return $response.access_token
     }
     catch {
-        Write-Error "Failed to obtain access token for scope '$Scope': $_"
+        Write-Error "Failed to obtain access token (tenant: $TenantId, client: $ClientId, scope: $Scope): $_"
         throw
     }
 }
@@ -107,6 +107,48 @@ function Get-FabricHeaders {
 # ============================================================================
 #  SECTION 3 — HTTP wrapper: retries on HTTP 429 with Retry-After back-off
 # ============================================================================
+function Write-HttpError {
+    <#
+    .SYNOPSIS
+        Logs a verbose breakdown of a failed HTTP call before the caller rethrows.
+    #>
+    param(
+        [System.Management.Automation.ErrorRecord]$ErrorRecord,
+        [string]$Method,
+        [string]$Uri
+    )
+
+    $statusCode  = $ErrorRecord.Exception.Response.StatusCode.value__
+    $statusText  = $ErrorRecord.Exception.Response.StatusCode        # enum name
+    $rawMessage  = $ErrorRecord.ErrorDetails.Message                 # PS7: body is here
+
+    Write-Error "--- HTTP ERROR ---"
+    Write-Error "  Method  : $Method"
+    Write-Error "  URL     : $Uri"
+    if ($statusCode) {
+        Write-Error "  Status  : $statusCode $statusText"
+    }
+
+    if ($rawMessage) {
+        # Pretty-print if the body is JSON, otherwise emit as-is
+        try {
+            $parsed = $rawMessage | ConvertFrom-Json -ErrorAction Stop
+            $pretty = $parsed | ConvertTo-Json -Depth 10
+            Write-Error "  Response:`n$pretty"
+        }
+        catch {
+            Write-Error "  Response: $rawMessage"
+        }
+    }
+
+    $inner = $ErrorRecord.Exception.InnerException
+    if ($inner) {
+        Write-Error "  Inner   : $($inner.GetType().Name): $($inner.Message)"
+    }
+
+    Write-Error "------------------"
+}
+
 function Invoke-FabricRestMethod {
     <#
     .SYNOPSIS
@@ -149,6 +191,7 @@ function Invoke-FabricRestMethod {
                 Start-Sleep -Seconds $retryAfter
             }
             else {
+                Write-HttpError -ErrorRecord $_ -Method $Method -Uri $Uri
                 throw
             }
         }
@@ -181,28 +224,68 @@ function Get-FabricConnections {
 #  RSA-OAEP encrypted using the gateway member's public key.
 #  This section uses .NET's RSACryptoServiceProvider directly — no NuGet needed.
 # ============================================================================
-function Get-GatewayPublicKey {
+function Get-GatewayClusterMembers {
     <#
     .SYNOPSIS
-        Retrieves the public key of a gateway, needed to encrypt credentials.
-        Uses the Power BI REST API, which requires a Power BI-scoped token
-        (https://analysis.windows.net/powerbi/api/.default).
+        Returns all member gateways (with their individual public keys) that belong
+        to a gateway cluster.
+
+    .DESCRIPTION
+        For a clustered on-premises gateway every member node holds its OWN RSA
+        private key.  Credentials must be encrypted separately for each node and
+        submitted as one entry per node in the 'values' array of the Fabric API
+        request body.  Encrypting only once (with the cluster-level key) causes:
+          - NTE_INVALID_PARAMETER  on the node whose key was NOT used
+          - DMTS_CredentialDetailsMissingErrorCode  on every node with no entry
+
+        This function calls GET /v1.0/myorg/gateways, then returns every gateway
+        whose id equals $GatewayId (a single-node or direct member lookup) OR whose
+        gatewayAnnotation.clusterId equals $GatewayId (all members of a cluster).
+
+        Falls back to a direct GET /v1.0/myorg/gateways/{id} if the list call
+        returns no matches (e.g. the caller supplied one member's own ID).
     #>
     param(
         [string]$PowerBiToken,
-        [string]$GatewayId
+        [string]$GatewayId     # cluster gateway ID  — or a single member ID
     )
 
-    $uri     = "https://api.powerbi.com/v1.0/myorg/gateways/$GatewayId"
     $headers = Get-FabricHeaders -Token $PowerBiToken
 
     try {
-        $gateway = Invoke-FabricRestMethod -Uri $uri -Headers $headers -Method GET
-        Write-Host "  Gateway '$($gateway.name)' public key retrieved."
-        return $gateway.publicKey
+        $all = Invoke-FabricRestMethod `
+                   -Uri "https://api.powerbi.com/v1.0/myorg/gateways" `
+                   -Headers $headers -Method GET
+
+        $members = @(
+            $all.value | Where-Object {
+                # direct match (member ID supplied)
+                $_.id -eq $GatewayId -or
+                # cluster match — clusterId is embedded in gatewayAnnotation (string or object)
+                ($_.gatewayAnnotation -and $(
+                    $ann = $_.gatewayAnnotation
+                    if ($ann -is [string]) { $ann = $ann | ConvertFrom-Json -ErrorAction SilentlyContinue }
+                    $ann -and $ann.clusterId -eq $GatewayId
+                ))
+            }
+        )
+
+        if ($members.Count -eq 0) {
+            # Fall back: treat $GatewayId as a single gateway, fetch it directly
+            Write-Warning "No cluster members found for '$GatewayId' via list API — falling back to direct lookup."
+            $gw      = Invoke-FabricRestMethod `
+                           -Uri "https://api.powerbi.com/v1.0/myorg/gateways/$GatewayId" `
+                           -Headers $headers -Method GET
+            $members = @($gw)
+        }
+
+        foreach ($m in $members) {
+            Write-Host "  Gateway member '$($m.name)' (ID: $($m.id)) public key retrieved."
+        }
+        return $members
     }
     catch {
-        Write-Error "Failed to retrieve gateway info: $_"
+        Write-Error "Failed to retrieve gateway cluster members: $_"
         throw
     }
 }
@@ -293,14 +376,16 @@ function Get-EncryptedCredentials {
     $rsa.ImportParameters($rsaParams)
     $encryptedKeys      = $rsa.Encrypt($keys, $true)   # $true = OAEP (SHA-1), matching CAPI gateway
 
-    # --- Step 5: Concatenate both base64 blobs (matches SDK output format) ---
-    # The gateway splits this string by position, not by a delimiter.
-    # A 2048-bit RSA key always produces exactly 256 bytes of ciphertext, which
-    # base64-encodes to exactly 344 characters. The gateway reads the first 344
-    # characters as the RSA-encrypted key bundle and treats everything after that
-    # as the AES ciphertext blob. No separator is needed because the RSA output
-    # length is fixed for a given key size.
-    return [Convert]::ToBase64String($encryptedKeys) + [Convert]::ToBase64String($ciphertextBlob)
+    # --- Step 5: Prepend RSA blob length then concatenate (matches SDK output format) ---
+    # The gateway reads a 4-byte little-endian length prefix to locate the RSA
+    # key bundle, then treats the remainder as the AES ciphertext blob.  Without
+    # the prefix, a 4096-bit member key produces 512 RSA bytes (684 base64 chars)
+    # instead of the 256/344 expected for 2048-bit, causing the gateway to split
+    # at the wrong offset and silently corrupt the credential.
+    $rsaLenBytes = [System.BitConverter]::GetBytes([uint32]$encryptedKeys.Length)
+    if (-not [System.BitConverter]::IsLittleEndian) { [Array]::Reverse($rsaLenBytes) }
+    $combined = $rsaLenBytes + $encryptedKeys + $ciphertextBlob
+    return [Convert]::ToBase64String($combined)
 }
 
 function New-OnPremGatewayConnection {
@@ -317,15 +402,22 @@ function New-OnPremGatewayConnection {
         [bool]  $SkipTestConnection = $false
     )
 
-    # Step 1: get gateway public key (Power BI API — needs Power BI-scoped token)
-    $publicKey = Get-GatewayPublicKey -PowerBiToken $PowerBiToken -GatewayId $GatewayId
+    # Step 1: get all cluster member gateways (Power BI API — needs Power BI-scoped token)
+    # Each member has its own RSA key pair; credentials must be encrypted per-member.
+    $members = Get-GatewayClusterMembers -PowerBiToken $PowerBiToken -GatewayId $GatewayId
 
-    # Step 2: encrypt credentials
-    $encryptedCreds = Get-EncryptedCredentials `
-        -GatewayPublicKey $publicKey `
-        -SpnClientId $SpnClientId `
-        -SpnTenantId $SpnTenantId `
-        -SpnSecret $SpnSecret
+    # Step 2: encrypt credentials once per member using that member's public key
+    $credentialValues = [System.Collections.Generic.List[object]]::new()
+    foreach ($member in $members) {
+        $credentialValues.Add(@{
+            gatewayId            = $member.id
+            encryptedCredentials = Get-EncryptedCredentials `
+                -GatewayPublicKey $member.publicKey `
+                -SpnClientId $SpnClientId `
+                -SpnTenantId $SpnTenantId `
+                -SpnSecret $SpnSecret
+        })
+    }
 
     # Step 3: call Create Connection (Fabric API — needs Fabric-scoped token)
     $uri     = "https://api.fabric.microsoft.com/v1/connections"
@@ -350,12 +442,7 @@ function New-OnPremGatewayConnection {
             skipTestConnection   = $SkipTestConnection
             credentials          = @{
                 credentialType = "ServicePrincipal"
-                values         = @(
-                    @{
-                        gatewayId            = $GatewayId
-                        encryptedCredentials = $encryptedCreds
-                    }
-                )
+                values         = $credentialValues
             }
         }
     } | ConvertTo-Json -Depth 6
@@ -367,11 +454,7 @@ function New-OnPremGatewayConnection {
         return $result
     }
     catch {
-        Write-Error "Failed to create on-prem gateway connection: $_"
-        # FIX 2: Use ErrorDetails.Message — PS7 closes the response stream on error
-        if ($_.ErrorDetails.Message) {
-            Write-Error "API response: $($_.ErrorDetails.Message)"
-        }
+        Write-Error "Failed to create on-prem gateway connection '$DisplayName' (gateway: $GatewayId, server: $ServerName, db: $DatabaseName): $_"
         throw
     }
 }
@@ -388,15 +471,21 @@ function Update-OnPremGatewayConnectionSpnSecret {
         [bool]  $SkipTestConnection = $false
     )
 
-    # Step 1: get gateway public key (Power BI API — needs Power BI-scoped token)
-    $publicKey = Get-GatewayPublicKey -PowerBiToken $PowerBiToken -GatewayId $GatewayId
+    # Step 1: get all cluster member gateways (Power BI API — needs Power BI-scoped token)
+    $members = Get-GatewayClusterMembers -PowerBiToken $PowerBiToken -GatewayId $GatewayId
 
-    # Step 2: encrypt new credentials
-    $encryptedCreds = Get-EncryptedCredentials `
-        -GatewayPublicKey $publicKey `
-        -SpnClientId $SpnClientId `
-        -SpnTenantId $SpnTenantId `
-        -SpnSecret $SpnSecret
+    # Step 2: encrypt new credentials once per member using that member's public key
+    $credentialValues = [System.Collections.Generic.List[object]]::new()
+    foreach ($member in $members) {
+        $credentialValues.Add(@{
+            gatewayId            = $member.id
+            encryptedCredentials = Get-EncryptedCredentials `
+                -GatewayPublicKey $member.publicKey `
+                -SpnClientId $SpnClientId `
+                -SpnTenantId $SpnTenantId `
+                -SpnSecret $SpnSecret
+        })
+    }
 
     # Step 3: call Update Connection (PATCH — Fabric API — needs Fabric-scoped token)
     $uri     = "https://api.fabric.microsoft.com/v1/connections/$ConnectionId"
@@ -408,28 +497,19 @@ function Update-OnPremGatewayConnectionSpnSecret {
             skipTestConnection = $SkipTestConnection
             credentials        = @{
                 credentialType = "ServicePrincipal"
-                values         = @(
-                    @{
-                        gatewayId            = $GatewayId
-                        encryptedCredentials = $encryptedCreds
-                    }
-                )
+                values         = $credentialValues
             }
         }
     } | ConvertTo-Json -Depth 5
 
     Write-Host "Updating on-prem gateway connection '$ConnectionId' with new SPN secret ..."
     try {
-        $result = Invoke-FabricRestMethod -Uri $uri -Headers $headers -Method PATCH -Body $body
+        $result = Invoke-FabricRestMethod -Uri $uri -Headers $headers -Method PATCH -Body $body -ContentType "application/json"
         Write-Host "  -> Updated successfully."
         return $result
     }
     catch {
-        Write-Error "Failed to update on-prem gateway connection: $_"
-        # FIX 2: Use ErrorDetails.Message — PS7 closes the response stream on error
-        if ($_.ErrorDetails.Message) {
-            Write-Error "API response: $($_.ErrorDetails.Message)"
-        }
+        Write-Error "Failed to update on-prem gateway connection '$ConnectionId' (gateway: $GatewayId): $_"
         throw
     }
 }
