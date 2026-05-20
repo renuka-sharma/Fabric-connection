@@ -257,16 +257,29 @@ function Get-GatewayClusterMembers {
                    -Uri "https://api.powerbi.com/v1.0/myorg/gateways" `
                    -Headers $headers -Method GET
 
+        # Helper: safely extract clusterId from gatewayAnnotation (string or object)
+        function Get-ClusterId($gateway) {
+            $ann = $gateway.gatewayAnnotation
+            if (-not $ann) { return $null }
+            if ($ann -is [string]) { $ann = $ann | ConvertFrom-Json -ErrorAction SilentlyContinue }
+            return $ann.clusterId
+        }
+
+        # First pass: find the gateway whose id matches — could be a member or cluster root
+        $matched = $all.value | Where-Object { $_.id -eq $GatewayId } | Select-Object -First 1
+
+        # Resolve the effective cluster ID to use for sibling lookup
+        $effectiveClusterId = $GatewayId
+        if ($matched) {
+            $cid = Get-ClusterId $matched
+            if ($cid) { $effectiveClusterId = $cid }
+        }
+
+        # Second pass: collect all members whose clusterId matches, plus any direct ID match
         $members = @(
             $all.value | Where-Object {
-                # direct match (member ID supplied)
-                $_.id -eq $GatewayId -or
-                # cluster match — clusterId is embedded in gatewayAnnotation (string or object)
-                ($_.gatewayAnnotation -and $(
-                    $ann = $_.gatewayAnnotation
-                    if ($ann -is [string]) { $ann = $ann | ConvertFrom-Json -ErrorAction SilentlyContinue }
-                    $ann -and $ann.clusterId -eq $GatewayId
-                ))
+                $_.id -eq $effectiveClusterId -or
+                (Get-ClusterId $_) -eq $effectiveClusterId
             }
         )
 
@@ -376,16 +389,7 @@ function Get-EncryptedCredentials {
     $rsa.ImportParameters($rsaParams)
     $encryptedKeys      = $rsa.Encrypt($keys, $true)   # $true = OAEP (SHA-1), matching CAPI gateway
 
-    # --- Step 5: Prepend RSA blob length then concatenate (matches SDK output format) ---
-    # The gateway reads a 4-byte little-endian length prefix to locate the RSA
-    # key bundle, then treats the remainder as the AES ciphertext blob.  Without
-    # the prefix, a 4096-bit member key produces 512 RSA bytes (684 base64 chars)
-    # instead of the 256/344 expected for 2048-bit, causing the gateway to split
-    # at the wrong offset and silently corrupt the credential.
-    $rsaLenBytes = [System.BitConverter]::GetBytes([uint32]$encryptedKeys.Length)
-    if (-not [System.BitConverter]::IsLittleEndian) { [Array]::Reverse($rsaLenBytes) }
-    $combined = $rsaLenBytes + $encryptedKeys + $ciphertextBlob
-    return [Convert]::ToBase64String($combined)
+    return [Convert]::ToBase64String($encryptedKeys) + [Convert]::ToBase64String($ciphertextBlob)
 }
 
 function New-OnPremGatewayConnection {
