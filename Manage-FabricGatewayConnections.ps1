@@ -122,11 +122,11 @@ function Write-HttpError {
     $statusText  = $ErrorRecord.Exception.Response.StatusCode        # enum name
     $rawMessage  = $ErrorRecord.ErrorDetails.Message                 # PS7: body is here
 
-    Write-Error "--- HTTP ERROR ---"
-    Write-Error "  Method  : $Method"
-    Write-Error "  URL     : $Uri"
+    Write-Host "##[error]--- HTTP ERROR ---"
+    Write-Host "##[error]  Method  : $Method"
+    Write-Host "##[error]  URL     : $Uri"
     if ($statusCode) {
-        Write-Error "  Status  : $statusCode $statusText"
+        Write-Host "##[error]  Status  : $statusCode $statusText"
     }
 
     if ($rawMessage) {
@@ -134,19 +134,19 @@ function Write-HttpError {
         try {
             $parsed = $rawMessage | ConvertFrom-Json -ErrorAction Stop
             $pretty = $parsed | ConvertTo-Json -Depth 10
-            Write-Error "  Response:`n$pretty"
+            Write-Host "##[error]  Response:`n$pretty"
         }
         catch {
-            Write-Error "  Response: $rawMessage"
+            Write-Host "##[error]  Response: $rawMessage"
         }
     }
 
     $inner = $ErrorRecord.Exception.InnerException
     if ($inner) {
-        Write-Error "  Inner   : $($inner.GetType().Name): $($inner.Message)"
+        Write-Host "##[error]  Inner   : $($inner.GetType().Name): $($inner.Message)"
     }
 
-    Write-Error "------------------"
+    Write-Host "##[error]------------------"
 }
 
 function Invoke-FabricRestMethod {
