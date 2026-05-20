@@ -265,6 +265,8 @@ function Get-GatewayClusterMembers {
             return $ann.clusterId
         }
 
+        Write-Host "  Gateway list returned $($all.value.Count) gateway(s) total."
+
         # First pass: find the gateway whose id matches — could be a member or cluster root
         $matched = $all.value | Where-Object { $_.id -eq $GatewayId } | Select-Object -First 1
 
@@ -272,16 +274,30 @@ function Get-GatewayClusterMembers {
         $effectiveClusterId = $GatewayId
         if ($matched) {
             $cid = Get-ClusterId $matched
+            Write-Host "  Gateway '$($matched.name)' (ID: $($matched.id)) clusterId: '$cid'"
             if ($cid) { $effectiveClusterId = $cid }
         }
+        Write-Host "  Effective cluster ID for member lookup: '$effectiveClusterId'"
 
-        # Second pass: collect all members whose clusterId matches, plus any direct ID match
+        # Log all gateways with their resolved clusterIds to help diagnose missed members
+        foreach ($gw in $all.value) {
+            $cid = Get-ClusterId $gw
+            Write-Host "    Gateway in list: '$($gw.name)' id='$($gw.id)' clusterId='$cid'"
+        }
+
+        # Second pass: collect all members whose id OR clusterId matches the effective cluster ID
         $members = @(
             $all.value | Where-Object {
                 $_.id -eq $effectiveClusterId -or
                 (Get-ClusterId $_) -eq $effectiveClusterId
             }
         )
+
+        # Always ensure the originally-requested gateway is included (guards against annotation parse failures)
+        if ($matched -and -not ($members | Where-Object { $_.id -eq $matched.id })) {
+            Write-Warning "  Originally-matched gateway '$($matched.name)' ($($matched.id)) not in cluster set — adding explicitly."
+            $members = @($matched) + $members
+        }
 
         if ($members.Count -eq 0) {
             # Fall back: treat $GatewayId as a single gateway, fetch it directly
@@ -385,9 +401,9 @@ function Get-EncryptedCredentials {
     $rsaParams          = New-Object System.Security.Cryptography.RSAParameters
     $rsaParams.Exponent = $exponentBytes
     $rsaParams.Modulus  = $modulusBytes
-    $rsa                = New-Object System.Security.Cryptography.RSACryptoServiceProvider
+    $rsa                = [System.Security.Cryptography.RSA]::Create()
     $rsa.ImportParameters($rsaParams)
-    $encryptedKeys      = $rsa.Encrypt($keys, $true)   # $true = OAEP (SHA-1), matching CAPI gateway
+    $encryptedKeys      = $rsa.Encrypt($keys, [System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
 
     return [Convert]::ToBase64String($encryptedKeys) + [Convert]::ToBase64String($ciphertextBlob)
 }
