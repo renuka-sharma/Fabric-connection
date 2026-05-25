@@ -16,8 +16,9 @@ Updating the secret manually through the Fabric portal is not sustainable across
 
 ```
 Fabric-connection/
-├── Manage-FabricGatewayConnections.ps1   # PowerShell script — core logic
-├── azure-pipelines-rotate-spn-secret.yml # ADO pipeline definition
+├── Manage-FabricGatewayConnections.ps1        # PowerShell script — core logic
+├── azure-pipelines-rotate-spn-secret.yml      # ADO pipeline — create / rotate connections
+├── azure-pipelines-test-db-connection.yml     # ADO pipeline — test SQL connectivity via SPN
 └── README.md
 ```
 
@@ -89,10 +90,25 @@ Create the following secrets in your Key Vault:
 ### 4. Microsoft Fabric
 
 - Fabric admin setting **"Service principals can use Fabric APIs"** must be enabled for a security group that contains the automation SPN. Set this in the Fabric Admin portal under Developer settings.
+- Without this setting the `POST /v1/connections` call will fail with `CreateGatewayConnectionFailed` even if the SPN can authenticate successfully.
 
 ### 5. On-premises data gateway
 
 - The automation SPN must be a **gateway admin**. Set this in the Power BI portal under the gateway settings. Without this the pipeline cannot fetch the gateway public key and will fail with a 403.
+- For a **gateway cluster**, the SPN must be admin on the cluster — all member nodes inherit this. The script automatically discovers all active cluster members and encrypts credentials per node.
+
+### 6. SQL Server
+
+- The data-source SPN must have a SQL login on the target database. Run in `master`:
+  ```sql
+  CREATE LOGIN [<spn-display-name>] FROM EXTERNAL PROVIDER
+  ```
+  Then in the target database:
+  ```sql
+  CREATE USER [<spn-display-name>] FROM EXTERNAL PROVIDER
+  ALTER ROLE db_datareader ADD MEMBER [<spn-display-name>]
+  ```
+- The gateway machine's IP must be whitelisted on the SQL server firewall (Azure Portal → SQL Server → Networking → Firewall rules).
 
 ---
 
@@ -170,20 +186,36 @@ Run the pipeline once per connection, passing a different `connectionId` each ti
 | `Constructor not found` on RSAParameters | Old version of the script using `::new()` | Ensure you are using the fixed script with `New-Object System.Security.Cryptography.RSAParameters` |
 | `Bad Length` / `wrong input size` on Encrypt | Credential payload exceeds RSA key limit | Verify the gateway uses a 4096-bit key; a 2048-bit key allows only 214 bytes, the credential JSON is ~275 bytes |
 | Pipeline passes but connection still fails at refresh | `skipTestConnection` was `true` and secret is wrong | Run with `skipTestConnection = false` to surface the real error |
+| `NTE_INVALID_PARAMETER` / HResult `-2146893785` on node | Wrong RSA padding — gateway expects OaepSHA256 not OaepSHA1 | Ensure the script uses `RSA.Create()` with `RSAEncryptionPadding.OaepSHA256` |
+| `DMTS_CredentialDetailsMissingErrorCode` on a cluster node | Script only found one node — cluster member lookup failed | Pass the cluster ID as `gatewayId`, not an individual member ID. The script resolves sibling nodes via `gatewayAnnotation.clusterId` |
+| `DM_GWPipeline_Gateway_ConnectionBrokenException` (TCP 10054) | Gateway machine cannot reach the SQL server | Check firewall rules on the SQL server and run `Test-NetConnection -ComputerName <server> -Port 1433` on the gateway machine |
+| `CreateGatewayConnectionFailed` with no inner error | "Service principals can use Fabric APIs" is disabled | Enable the setting in Fabric Admin portal → Tenant settings → Developer settings |
 
 ---
 
-## Encryption fix — RSACryptoServiceProvider → RSA.Create()
+## Encryption design
 
-The credential encryption was updated from the legacy `RSACryptoServiceProvider` to `RSA.Create()`.
+The script implements **hybrid encryption** matching the Microsoft PowerBI-CSharp SDK (`AsymmetricHigherKeyEncryptionHelper.cs`). Direct RSA encryption of the credential JSON fails because the payload (~275 bytes) exceeds the RSA-OAEP limit of a 2048-bit key. The gateway expects:
 
-**Why it broke:** `RSACryptoServiceProvider::new(2048)` locks its internal context at 2048 bits. Even after calling `ImportParameters` with the gateway's actual 4096-bit public key, the provider still enforced the 2048-bit OAEP limit of **214 bytes**. The credential JSON (two GUIDs + the SPN secret) is ~275 bytes — over that limit — which caused the `"Bad Length."` error.
+1. Generate ephemeral **AES-256** key (32 bytes) and **HMAC-SHA256** key (64 bytes)
+2. Encrypt the credential JSON with **AES-256-CBC + HMAC-SHA256** (encrypt-then-MAC)
+3. Pack the two ephemeral keys into a 98-byte bundle and **RSA-OAEP-SHA256** encrypt it using the gateway's public key — well within the RSA limit
+4. Return `base64(RSA-encrypted key bundle) + base64(AES ciphertext blob)`
 
-**What was changed:** Replaced `RSACryptoServiceProvider` with `RSA.Create()`, the modern .NET factory. It derives the effective key size from the imported modulus, correctly applying the 4096-bit limit of **470 bytes**, which fits the credential payload.
+### RSA padding — OaepSHA256
 
-**When it can happen again:**
-- If the credential payload grows beyond 470 bytes (e.g. new fields added, very long secret).
-- If a gateway is registered with a 2048-bit key — the code fix alone cannot resolve that; the gateway key would need to be regenerated at 4096 bits.
+The gateway expects **OaepSHA256** padding, matching the SDK's `RSAEncryptionPadding.OaepSHA256`. Using OaepSHA1 (the legacy `RSACryptoServiceProvider` default) causes `NTE_INVALID_PARAMETER` / HResult `-2146893785` on the gateway node. The script uses `RSA.Create()` with explicit `OaepSHA256` padding.
+
+### Gateway cluster support
+
+Each node in a gateway cluster holds its own RSA private key. Credentials must be encrypted separately for each active node and submitted as one entry per node in the `values` array. The script:
+
+1. Calls `GET /v1.0/myorg/gateways` to list all gateways
+2. Resolves the cluster ID from the supplied `gatewayId` (which may be a member ID or cluster ID)
+3. Collects all sibling nodes via `gatewayAnnotation.clusterId`
+4. Encrypts credentials once per node using that node's public key
+
+Disabled or offline nodes are excluded automatically — they do not appear in the gateway list API response.
 
 ---
 

@@ -1,0 +1,54 @@
+# Tests SQL connectivity using the data-source SPN — run this to verify
+# network access and SQL login before running the main connection pipeline.
+
+trigger: none
+
+parameters:
+  - name: serverName
+    displayName: "SQL Server hostname"
+    type: string
+    default: ""
+  - name: databaseName
+    displayName: "Database name"
+    type: string
+    default: ""
+
+variables:
+  - group: "FabricSecrets"
+
+pool:
+  vmImage: "windows-latest"
+
+steps:
+  - task: AzurePowerShell@5
+    displayName: "Test SQL connection via SPN"
+    inputs:
+      azureSubscription: "<YOUR-AZURE-SERVICE-CONNECTION>"
+      ScriptType: InlineScript
+      azurePowerShellVersion: LatestVersion
+      pwsh: true
+      Inline: |
+        # Acquire token for Azure SQL
+        $body = @{
+            client_id     = "$(DataSourceSpnClientId)"
+            client_secret = "$(DataSourceSpnNewSecret)"
+            scope         = "https://database.windows.net/.default"
+            grant_type    = "client_credentials"
+        }
+        $token = (Invoke-RestMethod `
+            -Uri "https://login.microsoftonline.com/$(DataSourceSpnTenantId)/oauth2/v2.0/token" `
+            -Method POST -Body $body -ContentType "application/x-www-form-urlencoded").access_token
+        Write-Host "Token acquired."
+
+        # Test SQL connection
+        $conn = New-Object System.Data.SqlClient.SqlConnection(
+            "Server=tcp:${{ parameters.serverName }},1433;Initial Catalog=${{ parameters.databaseName }};Encrypt=True;Connection Timeout=30;")
+        $conn.AccessToken = $token
+        $conn.Open()
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandText = "SELECT DB_NAME() AS db, SUSER_SNAME() AS login"
+        $r = $cmd.ExecuteReader()
+        while ($r.Read()) {
+            Write-Host "Connected — DB: $($r['db'])  Login: $($r['login'])"
+        }
+        $conn.Close()
